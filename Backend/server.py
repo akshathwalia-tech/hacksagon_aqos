@@ -1,30 +1,56 @@
+import os
+import asyncio
+import random
+import logging
+import threading
+ml_installed = False
+try:
+    import joblib
+    import numpy as np
+    ml_installed = True
+except ImportError:
+    pass
+import requests
+import csv
+from pathlib import Path
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from motor.motor_asyncio import AsyncIOMotorClient
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
-from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional, Literal
 import uuid
-from datetime import datetime, timezone, timedelta
-from passlib.context import CryptContext
-from jose import JWTError, jwt
-import asyncio
-import random
 import google.generativeai as genai
+from starlette.middleware.cors import CORSMiddleware
+
+# --- Safely Import TensorFlow ---
+tf_installed = False
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, load_model as keras_load_model
+    from tensorflow.keras.layers import LSTM, Dense
+    from tensorflow.keras.optimizers import Adam
+    tf_installed = True
+except ImportError:
+    pass
+
+try:
+    from sklearn.ensemble import IsolationForest
+except ImportError:
+    pass
+
+from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
@@ -32,11 +58,190 @@ JWT_SECRET_KEY = os.environ['JWT_SECRET_KEY']
 JWT_ALGORITHM = os.environ['JWT_ALGORITHM']
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ['ACCESS_TOKEN_EXPIRE_MINUTES'])
 
-# Create the main app
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# ==================== MODELS ====================
+# --- ML ENGINE & STATE ---
+ZONES = ["Zone A - Downtown", "Zone B - Industrial", "Zone C - Residential", "Zone D - Commercial"]
+RECENT_DATA_BUFFER = deque(maxlen=500)
+global_weather = {"temp": 25.0, "humidity": 50.0}
+
+def init_zone_state():
+    return {
+        "valve_open": True,
+        "manual_leak": False,
+        "alert_status": "NORMAL",
+        "consecutive_leaks": 0,
+        "auto_mitigation_active": False
+    }
+
+system_state = {zone: init_zone_state() for zone in ZONES}
+
+sentinel_model = IsolationForest(contamination=0.1, random_state=42) if ml_installed else None
+is_sentinel_trained = False
+lstm_model = None
+is_lstm_trained = False
+
+LSTM_MODEL_PATH = ROOT_DIR / "lstm_demand.keras"
+SENTINEL_MODEL_PATH = ROOT_DIR / "sentinel_model.pkl"
+
+def load_models():
+    global sentinel_model, is_sentinel_trained, lstm_model, is_lstm_trained
+    if os.path.exists(SENTINEL_MODEL_PATH):
+        try:
+            sentinel_model = joblib.load(SENTINEL_MODEL_PATH)
+            is_sentinel_trained = True
+        except: pass
+        
+    if tf_installed and os.path.exists(LSTM_MODEL_PATH):
+        try:
+            lstm_model = keras_load_model(LSTM_MODEL_PATH)
+            is_lstm_trained = True
+        except: pass
+
+def init_lstm_architecture():
+    global lstm_model
+    if not tf_installed: return
+    model = Sequential([
+        LSTM(32, activation='relu', input_shape=(30, 3)),
+        Dense(16, activation='relu'),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.01), loss='mse')
+    lstm_model = model
+
+async def fetch_weather_loop():
+    while True:
+        try:
+            url = "https://api.open-meteo.com/v1/forecast?latitude=26.2183&longitude=78.1828&current=temperature_2m,relative_humidity_2m"
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                global_weather["temp"] = data["current"]["temperature_2m"]
+                global_weather["humidity"] = data["current"]["relative_humidity_2m"]
+        except: pass
+        await asyncio.sleep(600)
+
+def analyze_data(zone: str, flow: float, pressure: float, freq: float):
+    if not is_sentinel_trained or sentinel_model is None:
+        # Graceful fallback: Heuristic threshold detection if ML model isn't active
+        if flow > 80.0 or freq > 300.0 or system_state[zone].get("manual_leak", False):
+            system_state[zone]["alert_status"] = "CRITICAL_LEAK"
+        else:
+            system_state[zone]["alert_status"] = "NORMAL"
+        return
+        
+    try:
+        prediction = sentinel_model.predict([[flow, pressure, freq]])
+        if prediction[0] == -1 and (flow > 20 or freq > 220):
+            system_state[zone]["alert_status"] = "CRITICAL_LEAK"
+        else:
+            system_state[zone]["alert_status"] = "NORMAL"
+    except: pass
+
+def train_sentinel():
+    global is_sentinel_trained
+    try:
+        data = [[float(r['flow']), float(r['pressure']), float(r['frequency'])] for r in list(RECENT_DATA_BUFFER)]
+        if len(data) > 50:
+            sentinel_model.fit(data)
+            is_sentinel_trained = True
+            joblib.dump(sentinel_model, SENTINEL_MODEL_PATH)
+    except Exception as e: pass
+
+def train_lstm():
+    global is_lstm_trained
+    if not tf_installed: return
+    data = [[r['flow'], r['temp'], r['humidity']] for r in list(RECENT_DATA_BUFFER) if r['zone'] == ZONES[0]]
+    if len(data) < 35: return
+    X, y = [], []
+    for i in range(len(data) - 30):
+        X.append(data[i:i+30])
+        y.append(data[i+30][0])
+    X_tx = np.array(X)
+    y_tx = np.array(y)
+    try:
+        if lstm_model is None: init_lstm_architecture()
+        lstm_model.fit(X_tx, y_tx, epochs=5, verbose=0)
+        is_lstm_trained = True
+        lstm_model.save(LSTM_MODEL_PATH)
+    except Exception as e: pass
+
+async def dynamic_simulator():
+    iteration = 0
+    while True:
+        iteration += 1
+        ts = datetime.now(timezone.utc).isoformat()
+        
+        ctemp = global_weather["temp"]
+        chumid = global_weather["humidity"]
+            
+        for zone in ZONES:
+            v_open = system_state[zone]["valve_open"]
+            m_leak = system_state[zone]["manual_leak"]
+            
+            if v_open:
+                if m_leak:
+                    flow, pressure, frequency = 85.0, 48.0, 345.0
+                else:
+                    weather_multiplier = (ctemp / 25.0) 
+                    b = ZONES.index(zone) * 0.5 
+                    flow = (8.0 + b + random.uniform(-0.5, 0.5)) * weather_multiplier
+                    pressure = 50.0 - b + random.uniform(-2.0, 2.0)
+                    frequency = 180.0 + random.uniform(-10.0, 10.0)
+            else:
+                flow, pressure, frequency = 0.0, 5.0, 0.0
+            
+            row_data = {
+                "timestamp": ts, "zone": zone, "flow": flow, 
+                "pressure": pressure, "frequency": frequency,
+                "temp": ctemp, "humidity": chumid
+            }
+            RECENT_DATA_BUFFER.append(row_data)
+            
+            try:
+                file_exists = os.path.isfile("live_data.csv")
+                with open("live_data.csv", mode='a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=row_data.keys())
+                    if not file_exists: writer.writeheader()
+                    writer.writerow(row_data)
+            except Exception: pass
+            
+            analyze_data(zone, flow, pressure, frequency)
+            
+            if system_state[zone]["alert_status"] == "CRITICAL_LEAK":
+                system_state[zone]["consecutive_leaks"] += 1
+                if system_state[zone]["consecutive_leaks"] >= 3 and system_state[zone]["valve_open"]:
+                    system_state[zone]["valve_open"] = False
+                    system_state[zone]["auto_mitigation_active"] = True
+                    
+                    # Generate DB Alert automatically!
+                    doc = {
+                        "id": str(uuid.uuid4()),
+                        "zone_id": zone,
+                        "zone_name": zone,
+                        "severity": "critical",
+                        "type": "Pipe Burst Anomaly",
+                        "description": "Auto-mitigation engaged. Valve closed due to ML isolation forest leak signature.",
+                        "status": "active",
+                        "detected_at": ts,
+                        "acoustic_signature": f"FFT-{int(frequency)}Hz-Peak"
+                    }
+                    await db.leak_alerts.insert_one(doc)
+            else:
+                system_state[zone]["consecutive_leaks"] = 0
+                
+        if iteration % 100 == 0: train_sentinel()
+        if iteration % 200 == 0: train_lstm()
+            
+        await asyncio.sleep(2)
+
+
+# --- MODELS ---
+class ControlRequest(BaseModel):
+    zone: str
+    valve_open: Optional[bool] = None
+    manual_leak: Optional[bool] = None
 
 class UserRole(BaseModel):
     role: Literal["admin", "operator", "analyst"]
@@ -64,44 +269,6 @@ class Token(BaseModel):
     token_type: str
     user: User
 
-class WaterZone(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    name: str
-    location: str
-    sensor_count: int
-    status: Literal["active", "warning", "critical"]
-    current_consumption: float
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class WaterZoneCreate(BaseModel):
-    name: str
-    location: str
-    sensor_count: int
-    status: Literal["active", "warning", "critical"] = "active"
-    current_consumption: float
-
-class ConsumptionData(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    zone_id: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    consumption: float
-    flow_rate: float
-    pressure: float
-
-class LeakAlert(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    zone_id: str
-    zone_name: str
-    severity: Literal["low", "medium", "high", "critical"]
-    type: str
-    description: str
-    status: Literal["active", "acknowledged", "resolved"]
-    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    acoustic_signature: Optional[str] = None
-
 class LeakAlertCreate(BaseModel):
     zone_id: str
     zone_name: str
@@ -111,345 +278,217 @@ class LeakAlertCreate(BaseModel):
     status: Literal["active", "acknowledged", "resolved"] = "active"
     acoustic_signature: Optional[str] = None
 
-class ForecastData(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    zone_id: str
-    forecast_date: datetime
-    predicted_consumption: float
-    confidence: float
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
 class AIAnalysisRequest(BaseModel):
     zone_id: Optional[str] = None
     analysis_type: Literal["forecast", "anomaly", "recommendation"]
     time_range: Optional[str] = "24h"
 
-class AIAnalysisResponse(BaseModel):
-    analysis_type: str
-    result: str
-    confidence: float
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-# ==================== AUTH UTILITIES ====================
-
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
+# --- AUTH UTILITIES ---
+def verify_password(plain_password, hashed_password): return pwd_context.verify(plain_password, hashed_password)
+def get_password_hash(password): return pwd_context.hash(password)
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-    return encoded_jwt
+    to_encode.update({"exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)})
+    return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(credentials.credentials, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         user_id: str = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        
+        if user_id is None: raise HTTPException(status_code=401)
         user_doc = await db.users.find_one({"id": user_id}, {"_id": 0, "password": 0})
-        if user_doc is None:
-            raise HTTPException(status_code=401, detail="User not found")
-        
-        if isinstance(user_doc['created_at'], str):
-            user_doc['created_at'] = datetime.fromisoformat(user_doc['created_at'])
-        
+        if user_doc is None: raise HTTPException(status_code=401)
+        if isinstance(user_doc['created_at'], str): user_doc['created_at'] = datetime.fromisoformat(user_doc['created_at'])
         return User(**user_doc)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    except: raise HTTPException(status_code=401)
 
-# ==================== AUTH ENDPOINTS ====================
-
+# --- ENDPOINTS ---
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_input: UserCreate):
-    existing_user = await db.users.find_one({"email": user_input.email})
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
+    if await db.users.find_one({"email": user_input.email}): raise HTTPException(status_code=400)
     user_dict = user_input.model_dump()
-    hashed_password = get_password_hash(user_dict.pop("password"))
-    
+    user_dict['password'] = get_password_hash(user_dict.pop("password"))
     user_obj = User(**user_dict)
-    user_doc = user_obj.model_dump()
-    user_doc['created_at'] = user_doc['created_at'].isoformat()
-    user_doc['password'] = hashed_password
-    
-    await db.users.insert_one(user_doc)
-    
-    access_token = create_access_token(data={"sub": user_obj.id})
-    return Token(access_token=access_token, token_type="bearer", user=user_obj)
+    doc = user_obj.model_dump()
+    doc['created_at'] = doc['created_at'].isoformat()
+    await db.users.insert_one(doc)
+    return Token(access_token=create_access_token({"sub": user_obj.id}), token_type="bearer", user=user_obj)
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
-    user_doc = await db.users.find_one({"email": credentials.email})
-    if not user_doc:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    if not verify_password(credentials.password, user_doc['password']):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    user_doc.pop('password')
-    user_doc.pop('_id')
-    
-    if isinstance(user_doc['created_at'], str):
-        user_doc['created_at'] = datetime.fromisoformat(user_doc['created_at'])
-    
-    user_obj = User(**user_doc)
-    access_token = create_access_token(data={"sub": user_obj.id})
-    
-    return Token(access_token=access_token, token_type="bearer", user=user_obj)
+    doc = await db.users.find_one({"email": credentials.email})
+    if not doc or not verify_password(credentials.password, doc['password']): raise HTTPException(status_code=401)
+    doc.pop('password'); doc.pop('_id')
+    if isinstance(doc['created_at'], str): doc['created_at'] = datetime.fromisoformat(doc['created_at'])
+    user_obj = User(**doc)
+    return Token(access_token=create_access_token({"sub": user_obj.id}), token_type="bearer", user=user_obj)
 
 @api_router.get("/auth/me", response_model=User)
-async def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+async def get_me(current_user: User = Depends(get_current_user)): return current_user
 
-# ==================== WATER ZONES ====================
-
-@api_router.get("/zones", response_model=List[WaterZone])
-async def get_zones(current_user: User = Depends(get_current_user)):
-    zones = await db.zones.find({}, {"_id": 0}).to_list(1000)
-    for zone in zones:
-        if isinstance(zone['created_at'], str):
-            zone['created_at'] = datetime.fromisoformat(zone['created_at'])
-    return zones
-
-@api_router.post("/zones", response_model=WaterZone)
-async def create_zone(zone_input: WaterZoneCreate, current_user: User = Depends(get_current_user)):
-    if current_user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    zone_obj = WaterZone(**zone_input.model_dump())
-    zone_doc = zone_obj.model_dump()
-    zone_doc['created_at'] = zone_doc['created_at'].isoformat()
-    
-    await db.zones.insert_one(zone_doc)
-    return zone_obj
-
-# ==================== DASHBOARD DATA ====================
+@api_router.post("/control")
+async def update_control(req: ControlRequest, current_user: User = Depends(get_current_user)):
+    zone = req.zone
+    if zone not in system_state: raise HTTPException(status_code=400)
+    if req.valve_open is not None:
+        system_state[zone]["valve_open"] = req.valve_open
+        if req.valve_open: system_state[zone]["auto_mitigation_active"] = False
+    if req.manual_leak is not None: 
+        system_state[zone]["manual_leak"] = req.manual_leak
+    return {"status": "ok", "state": system_state[zone]}
 
 @api_router.get("/dashboard/stats")
 async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
-    zones = await db.zones.find({}, {"_id": 0}).to_list(1000)
-    alerts = await db.leak_alerts.find({"status": "active"}, {"_id": 0}).to_list(1000)
-    
-    total_consumption = sum(zone.get('current_consumption', 0) for zone in zones)
-    active_zones = len([z for z in zones if z.get('status') == 'active'])
-    critical_alerts = len([a for a in alerts if a.get('severity') == 'critical'])
+    total_consumption = 0
+    active_zones = 0
+    for z in ZONES:
+        if system_state[z]["valve_open"]: active_zones += 1
+        recent_flows = [r['flow'] for r in RECENT_DATA_BUFFER if r['zone'] == z]
+        if recent_flows: total_consumption += recent_flows[-1]
+        
+    alerts = await db.leak_alerts.count_documents({"status": "active"})
+    critical_alerts = await db.leak_alerts.count_documents({"status": "active", "severity": "critical"})
     
     return {
         "total_consumption": round(total_consumption, 2),
         "active_zones": active_zones,
-        "total_zones": len(zones),
-        "active_alerts": len(alerts),
+        "total_zones": len(ZONES),
+        "active_alerts": alerts,
         "critical_alerts": critical_alerts,
-        "efficiency_score": random.randint(85, 95)
+        "efficiency_score": random.randint(85, 95),
+        "system_state": system_state
     }
 
 @api_router.get("/dashboard/consumption-history")
 async def get_consumption_history(current_user: User = Depends(get_current_user)):
-    # Generate mock historical data
+    # Return last 30 flow events for the live telemetry chart
     history = []
-    for i in range(24):
+    for r in list(RECENT_DATA_BUFFER):
         history.append({
-            "hour": f"{i:02d}:00",
-            "consumption": random.uniform(800, 1200),
-            "predicted": random.uniform(750, 1150)
+            "timestamp": r["timestamp"].split("T")[1][:8], # HH:MM:SS
+            "zone": r["zone"].split(" - ")[0],
+            "consumption": r["flow"],
+            "pressure": r["pressure"]
         })
-    return history
+    return history[-50:]
 
 @api_router.get("/dashboard/zone-consumption")
 async def get_zone_consumption(current_user: User = Depends(get_current_user)):
-    zones = await db.zones.find({}, {"_id": 0}).to_list(1000)
-    return [{"name": z.get('name', 'Unknown'), "value": z.get('current_consumption', 0)} for z in zones]
+    result = []
+    for z in ZONES:
+        flows = [r['flow'] for r in RECENT_DATA_BUFFER if r['zone'] == z]
+        val = flows[-1] if flows else 0
+        result.append({"id": z, "name": z.split(" - ")[0], "value": round(val, 2)})
+    return result
 
-# ==================== LEAK DETECTION ====================
+@api_router.get("/zones")
+async def get_zones(current_user: User = Depends(get_current_user)):
+    result = []
+    for z in ZONES:
+        flows = [r['flow'] for r in RECENT_DATA_BUFFER if r['zone'] == z]
+        val = flows[-1] if flows else 0
+        state = system_state[z]
+        status = "critical" if state["alert_status"] == "CRITICAL_LEAK" else ("warning" if state["auto_mitigation_active"] else "active")
+        if not state["valve_open"] and not state["auto_mitigation_active"]: status = "active"
+        result.append({
+            "id": z,
+            "name": z,
+            "location": z.split(" - ")[1] if " - " in z else "Live Network Node",
+            "sensor_count": random.randint(8, 15),
+            "status": status,
+            "current_consumption": round(val, 2),
+            "is_valve_open": state["valve_open"],
+            "has_leak": state["manual_leak"]
+        })
+    return result
 
-@api_router.get("/leaks", response_model=List[LeakAlert])
+@api_router.get("/leaks")
 async def get_leak_alerts(status: Optional[str] = None, current_user: User = Depends(get_current_user)):
     query = {"status": status} if status else {}
     alerts = await db.leak_alerts.find(query, {"_id": 0}).sort("detected_at", -1).to_list(1000)
-    
-    for alert in alerts:
-        if isinstance(alert['detected_at'], str):
-            alert['detected_at'] = datetime.fromisoformat(alert['detected_at'])
-    
     return alerts
-
-@api_router.post("/leaks", response_model=LeakAlert)
-async def create_leak_alert(alert_input: LeakAlertCreate, current_user: User = Depends(get_current_user)):
-    if current_user.role not in ["admin", "operator"]:
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
-    alert_obj = LeakAlert(**alert_input.model_dump())
-    alert_doc = alert_obj.model_dump()
-    alert_doc['detected_at'] = alert_doc['detected_at'].isoformat()
-    
-    await db.leak_alerts.insert_one(alert_doc)
-    return alert_obj
 
 @api_router.patch("/leaks/{leak_id}/status")
 async def update_leak_status(leak_id: str, status: str, current_user: User = Depends(get_current_user)):
-    if current_user.role not in ["admin", "operator"]:
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-    
-    result = await db.leak_alerts.update_one(
-        {"id": leak_id},
-        {"$set": {"status": status}}
-    )
-    
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Alert not found")
-    
-    return {"message": "Status updated", "leak_id": leak_id, "new_status": status}
-
-# ==================== AI FORECASTING ====================
-
-
-@api_router.post("/ai/analyze", response_model=AIAnalysisResponse)
-async def ai_analysis(request: AIAnalysisRequest, current_user: User = Depends(get_current_user)):
-    try:
-        # Configure Gemini
-        genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        zones = await db.zones.find({}, {"_id": 0}).to_list(1000)
-        zone_data = "\n".join([f"{z.get('name', 'Unknown')}: {z.get('current_consumption', 0)} m³/h" for z in zones])
-        
-        if request.analysis_type == "forecast":
-            prompt = f"""Based on the following water consumption data, provide a brief forecast for the next 24 hours:
-{zone_data}
-
-Provide a concise forecast with predicted consumption trends and any potential concerns."""
-        elif request.analysis_type == "anomaly":
-            prompt = f"""Analyze the following water consumption data for anomalies:
-{zone_data}
-
-Identify any unusual patterns or potential issues."""
-        else:
-            prompt = f"""Based on the following water consumption data:
-{zone_data}
-
-Provide 3 actionable recommendations for water conservation and efficiency improvement."""
-        
-        # Generate AI response
-        response = model.generate_content(prompt)
-        
-        return AIAnalysisResponse(
-            analysis_type=request.analysis_type,
-            result=response.text,
-            confidence=random.uniform(0.85, 0.98)
-        )
-    except Exception as e:
-        logging.error(f"AI Analysis error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+    result = await db.leak_alerts.update_one({"id": leak_id}, {"$set": {"status": status}})
+    if result.modified_count == 0: raise HTTPException(status_code=404)
+    return {"message": "Status updated"}
 
 @api_router.get("/forecasts")
 async def get_forecasts(zone_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
-    # Generate mock forecast data
+    if not is_lstm_trained or not tf_installed:
+        # Graceful fallback: return simulated predictions since TensorFlow isn't available on Python 3.14
+        forecasts = []
+        for i in range(7):
+            forecasts.append({
+                "date": (datetime.now(timezone.utc) + timedelta(days=i)).strftime("%Y-%m-%d"),
+                "predicted": random.uniform(1800, 2500),
+                "lower_bound": random.uniform(1600, 1800),
+                "upper_bound": random.uniform(2500, 2800)
+            })
+        return forecasts
+        
+    historical = [[r['flow'], r['temp'], r['humidity']] for r in list(RECENT_DATA_BUFFER) if r['zone'] == ZONES[0]][-30:]
+    if len(historical) < 30:
+        return [{"date": (datetime.now(timezone.utc) + timedelta(days=i)).strftime("%Y-%m-%d"), "predicted": 0, "lower_bound": 0, "upper_bound": 0} for i in range(7)]
+        
+    tensor_input = np.array(historical).reshape(1, 30, 3)
+    predicted_val = float(lstm_model.predict(tensor_input, verbose=0)[0][0])
+    
     forecasts = []
     for i in range(7):
+        mut = predicted_val + random.uniform(-2, 2)*i
         forecasts.append({
             "date": (datetime.now(timezone.utc) + timedelta(days=i)).strftime("%Y-%m-%d"),
-            "predicted": random.uniform(18000, 25000),
-            "lower_bound": random.uniform(16000, 18000),
-            "upper_bound": random.uniform(25000, 28000)
+            "predicted": abs(mut * 1500),
+            "lower_bound": abs((mut-2) * 1400),
+            "upper_bound": abs((mut+2) * 1600)
         })
     return forecasts
 
-# ==================== ANALYTICS ====================
+@api_router.post("/ai/analyze")
+async def ai_analysis(request: AIAnalysisRequest, current_user: User = Depends(get_current_user)):
+    genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    flows = []
+    for z in ZONES:
+        zone_flows = [r['flow'] for r in RECENT_DATA_BUFFER if r['zone'] == z]
+        if zone_flows:
+            flows.append(f"{z}: {zone_flows[-1]:.2f} m3/h")
+            
+    try:
+        res = model.generate_content(f"Water system flows: {', '.join(flows)}. Weather: {global_weather['temp']}C. Write a 2 sentence {request.analysis_type} report.")
+        return {"analysis_type": request.analysis_type, "result": res.text, "confidence": 0.95}
+    except:
+        return {"analysis_type": request.analysis_type, "result": "AI Analysis unavailable.", "confidence": 0}
 
 @api_router.get("/analytics/heatmap")
-async def get_heatmap_data(current_user: User = Depends(get_current_user)):
-    zones = await db.zones.find({}, {"_id": 0}).to_list(1000)
-    return [{
-        "zone": z.get('name', 'Unknown'),
-        "consumption": z.get('current_consumption', 0),
-        "efficiency": random.uniform(70, 95),
-        "leak_risk": random.uniform(0, 30)
-    } for z in zones]
+async def get_heatmap(current_user: User = Depends(get_current_user)):
+    return [{"zone": z.split(" - ")[0], "consumption": 0, "efficiency": random.uniform(80,95), "leak_risk": 99 if system_state[z]['manual_leak'] else random.uniform(5,15)} for z in ZONES]
 
 @api_router.get("/analytics/trends")
-async def get_trends(period: str = "week", current_user: User = Depends(get_current_user)):
-    days = 7 if period == "week" else 30
-    trends = []
-    for i in range(days):
-        trends.append({
-            "date": (datetime.now(timezone.utc) - timedelta(days=days-i)).strftime("%Y-%m-%d"),
-            "consumption": random.uniform(18000, 25000),
-            "leaks_detected": random.randint(0, 5)
-        })
-    return trends
-
-# ==================== NOTIFICATIONS ====================
+async def get_trends(current_user: User = Depends(get_current_user)):
+    return [{"date": (datetime.now(timezone.utc) - timedelta(days=7-i)).strftime("%Y-%m-%d"), "consumption": random.uniform(18000, 25000), "leaks_detected": random.randint(0,2)} for i in range(7)]
 
 @api_router.get("/notifications")
 async def get_notifications(current_user: User = Depends(get_current_user)):
     alerts = await db.leak_alerts.find({"status": "active"}, {"_id": 0}).sort("detected_at", -1).limit(10).to_list(10)
-    
-    notifications = []
-    for alert in alerts:
-        notifications.append({
-            "id": alert.get('id'),
-            "type": "leak_alert",
-            "title": f"{alert.get('severity', 'Unknown').upper()} Leak Detected",
-            "message": f"{alert.get('description', 'No description')} in {alert.get('zone_name', 'Unknown Zone')}",
-            "timestamp": alert.get('detected_at'),
-            "severity": alert.get('severity', 'low')
-        })
-    
-    return notifications
+    return [{"id": a['id'], "type": "leak_alert", "title": f"Leak in {a.get('zone_name','')}", "message": a.get('description',''), "timestamp": a.get('detected_at',''), "severity": a.get('severity','low')} for a in alerts]
 
-# Include the router in the main app
 app.include_router(api_router)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("shutdown")
-async def shutdown_db_client():
+async def shutdown(): 
     client.close()
 
 @app.on_event("startup")
-async def init_demo_data():
-    """Initialize demo data if database is empty"""
-    try:
-        # Check if zones exist
-        existing_zones = await db.zones.count_documents({})
-        if existing_zones == 0:
-            # Create demo zones
-            demo_zones = [
-                {"id": str(uuid.uuid4()), "name": "Zone A - Downtown", "location": "Central District", "sensor_count": 12, "status": "active", "current_consumption": 1250.5, "created_at": datetime.now(timezone.utc).isoformat()},
-                {"id": str(uuid.uuid4()), "name": "Zone B - Industrial", "location": "East Sector", "sensor_count": 8, "status": "warning", "current_consumption": 2100.3, "created_at": datetime.now(timezone.utc).isoformat()},
-                {"id": str(uuid.uuid4()), "name": "Zone C - Residential", "location": "North Area", "sensor_count": 15, "status": "active", "current_consumption": 980.2, "created_at": datetime.now(timezone.utc).isoformat()},
-                {"id": str(uuid.uuid4()), "name": "Zone D - Commercial", "location": "West Plaza", "sensor_count": 10, "status": "active", "current_consumption": 1450.8, "created_at": datetime.now(timezone.utc).isoformat()}
-            ]
-            await db.zones.insert_many(demo_zones)
-            
-            # Create demo alerts
-            demo_alerts = [
-                {"id": str(uuid.uuid4()), "zone_id": demo_zones[1]['id'], "zone_name": "Zone B - Industrial", "severity": "high", "type": "Pipe Leak", "description": "Acoustic signature indicates pipe leak at junction B-7", "status": "active", "detected_at": datetime.now(timezone.utc).isoformat(), "acoustic_signature": "FFT-2450Hz-Peak"},
-                {"id": str(uuid.uuid4()), "zone_id": demo_zones[0]['id'], "zone_name": "Zone A - Downtown", "severity": "medium", "type": "Flow Anomaly", "description": "Unusual consumption pattern detected during off-peak hours", "status": "active", "detected_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()}
-            ]
-            await db.leak_alerts.insert_many(demo_alerts)
-            
-            logger.info("Demo data initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing demo data: {str(e)}")
+async def startup():
+    load_models()
+    asyncio.create_task(fetch_weather_loop())
+    asyncio.create_task(dynamic_simulator())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
