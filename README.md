@@ -34,5 +34,9 @@ tensorflow<br>
 numpy<br>
 You can directly install all these by running : pip install -r requirements.txt <br><br>
 <b>Installations & Dependencies (Frontend):</b><br>
-Simply run : npm install axios recharts lucide-react framer-motion clsx tailwind-merge
-
+Simply run :  npm install
+<br>
+<b>How to Run</b><br>
+Create 2 terminals, 1 for backend and 1 for frontend, change the directory accordingly to the subfolder <br>
+In Backend terminal after installing all the dependencies run : python -m uvicorn server:app --reload --port 8000  <br>
+In Frontend terminal after running "npm install" , run : npm start<br>
