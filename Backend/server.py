@@ -357,11 +357,13 @@ class RoleChecker:
 # --- ENDPOINTS ---
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_input: UserCreate):
-    if await db.users.find_one({"email": user_input.email}): raise HTTPException(status_code=400)
+    if await db.users.find_one({"email": user_input.email}): raise HTTPException(status_code=400, detail="Email already registered")
     user_dict = user_input.model_dump()
-    user_dict['password'] = get_password_hash(user_dict.pop("password"))
+    hashed_password = get_password_hash(user_dict.pop("password"))
+    user_dict['password'] = hashed_password
     user_obj = User(**user_dict)
     doc = user_obj.model_dump()
+    doc['password'] = hashed_password
     doc['created_at'] = doc['created_at'].isoformat()
     await db.users.insert_one(doc)
     return Token(access_token=create_access_token({"sub": user_obj.id}), token_type="bearer", user=user_obj)
@@ -369,8 +371,9 @@ async def register(user_input: UserCreate):
 @api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
     doc = await db.users.find_one({"email": credentials.email})
-    if not doc or not verify_password(credentials.password, doc['password']): raise HTTPException(status_code=401)
-    doc.pop('password'); doc.pop('_id')
+    if not doc or 'password' not in doc or not verify_password(credentials.password, doc['password']): raise HTTPException(status_code=401, detail="Authentication failed")
+    doc.pop('password', None)
+    doc.pop('_id', None)
     if isinstance(doc['created_at'], str): doc['created_at'] = datetime.fromisoformat(doc['created_at'])
     user_obj = User(**doc)
     return Token(access_token=create_access_token({"sub": user_obj.id}), token_type="bearer", user=user_obj)
