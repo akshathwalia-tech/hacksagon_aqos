@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AQOS | Sustainability OS</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body class="dark-theme">
+
+    <!-- Ambient Background Glow -->
+    <div class="ambient-glow bg-left"></div>
+    <div class="ambient-glow bg-right"></div>
+
+    <div class="dash-layout">
+        
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar glass-panel">
+            <div class="brand">
+                <div class="brand-logo">AQ</div>
+                <h1 class="brand-name">AQOS</h1>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" data-target="view-overview">
+                    <span class="icon">📊</span> Overview
+                </button>
+                <button class="nav-item" data-target="view-digital-twin">
+                    <span class="icon">🌐</span> Digital Twin
+                </button>
+                <button class="nav-item" data-target="view-predictive">
+                    <span class="icon">🧠</span> Predictive Analytics
+                </button>
+            </nav>
+
+            <!-- Global Status Indicator -->
+            <div class="system-status" id="sidebar-status">
+                <span class="status-dot dot normal"></span>
+                <span id="status-text">System Normal</span>
+            </div>
+            <div class="ml-status">
+                <span>AI Sentinel:</span> <span id="ml-badge" class="badge">TRAINING</span>
+            </div>
+        </aside>
+
+        <!-- Main Workspace -->
+        <main class="workspace">
+            <header class="top-bar">
+                <h2 id="page-title">Overview</h2>
+            </header>
+
+            <!-- ================= VIEW: OVERVIEW ================= -->
+            <div id="view-overview" class="view-active view-container">
+                
+                <!-- Zone Selector -->
+                <div class="zone-selector glass-panel">
+                    <button class="zone-tab active" data-zone="Zone A">
+                        Zone A <span class="zone-alert-dot" id="dot-Zone A"></span>
+                    </button>
+                    <button class="zone-tab" data-zone="Zone B">
+                        Zone B <span class="zone-alert-dot" id="dot-Zone B"></span>
+                    </button>
+                    <button class="zone-tab" data-zone="Zone C">
+                        Zone C <span class="zone-alert-dot" id="dot-Zone C"></span>
+                    </button>
+                </div>
+
+                <!-- Top Metrics & Controls Row -->
+                <div class="overview-top-row">
+                    <!-- Quick Stats -->
+                    <div class="metrics-grid">
+                        <div class="card metric-card glass-panel">
+                            <h3>Flow Rate</h3>
+                            <div class="value"><span id="val-flow">--</span> <span class="unit">L/min</span></div>
+                        </div>
+                        <div class="card metric-card glass-panel">
+                            <h3>Pressure</h3>
+                            <div class="value"><span id="val-pressure">--</span> <span class="unit">psi</span></div>
+                        </div>
+                        <div class="card metric-card glass-panel" id="alert-card">
+                            <h3>Valve Status</h3>
+                            <div class="value valve-status-text" id="val-valve">OPEN</div>
+                            <div class="sub-text highlight" id="val-mitigation">Standby</div>
+                        </div>
+                    </div>
+
+                    <!-- Separate Controls Base on User Request -->
+                    <div class="controls-panel glass-panel">
+                        <h3>Manual Override (<span id="ctrl-title-zone" class="highlight">Zone A</span>)</h3>
+                        <div class="control-buttons">
+                            <button class="btn btn-warning" id="btn-trigger-leak">⚡ Trigger Burst</button>
+                            <button class="btn btn-primary" id="btn-stop-leak">✓ Seal Pipe</button>
+                            <button class="btn btn-danger" id="btn-close-valve">⏏ Force Close Valve</button>
+                            <button class="btn btn-success" id="btn-restore-flow">↻ Open Valve</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Chart Row -->
+                <div class="chart-section glass-panel">
+                    <h3>Live Telemetry Feed</h3>
+                    <div class="chart-container">
+                        <canvas id="telemetryChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ================= VIEW: DIGITAL TWIN (SVG Map) ================= -->
+            <div id="view-digital-twin" class="view-hidden view-container">
+                <div class="digital-twin-wrapper glass-panel">
+                    <h3>Infrastructure Topology</h3>
+                    <div class="svg-map-container">
+                        <svg viewBox="0 0 1000 600" class="topology-map" xmlns="http://www.w3.org/2000/svg">
+                            <!-- Background Grid Elements (Cosmetic) -->
+                            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="rgba(255,255,255,0.03)" stroke-width="1"/>
+                            </pattern>
+                            <rect width="1000" height="600" fill="url(#grid)" />
+
+                            <defs>
+                                <!-- Glowing Filter Effects -->
+                                <filter id="glow-normal" x="-20%" y="-20%" width="140%" height="140%">
+                                    <feGaussianBlur stdDeviation="8" result="blur" />
+                                    <feComposite in="SourceGraphic" in2="blur" operator="over" />
+                                </filter>
+                                <filter id="glow-leak" x="-50%" y="-50%" width="200%" height="200%">
+                                    <feGaussianBlur stdDeviation="15" result="blur" />
+                                    <feComponentTransfer in="blur" result="glow">
+                                        <feFuncA type="linear" slope="1.5" />
+                                    </feComponentTransfer>
+                                    <feMerge>
+                                        <feMergeNode in="glow"/>
+                                        <feMergeNode in="SourceGraphic"/>
+                                    </feMerge>
+                                </filter>
+                            </defs>
+
+                            <!-- CENTRAL SOURCE HUB -->
+                            <g class="node-source" transform="translate(150, 300)">
+                                <circle cx="0" cy="0" r="45" class="hub-core" filter="url(#glow-normal)" />
+                                <circle cx="0" cy="0" r="30" class="hub-inner" />
+                                <text x="0" y="5" text-anchor="middle" class="hub-label">MAIN SUPPLY</text>
+                            </g>
+
+                            <!-- PIPES (With animated dash strokes) -->
+                            <!-- To Zone A (Top) -->
+                            <path id="pipe-ZoneA" d="M 195 300 L 250 300 L 400 150 L 700 150" class="svg-pipe normal pipe-flow-anim" />
+                            <!-- To Zone B (Middle) -->
+                            <path id="pipe-ZoneB" d="M 195 300 L 700 300" class="svg-pipe normal pipe-flow-anim" />
+                            <!-- To Zone C (Bottom) -->
+                            <path id="pipe-ZoneC" d="M 195 300 L 250 300 L 400 450 L 700 450" class="svg-pipe normal pipe-flow-anim" />
+
+                            <!-- ZONE A TERMINAL -->
+                            <g id="node-ZoneA" transform="translate(750, 150)" class="zone-node normal">
+                                <rect x="-50" y="-35" width="100" height="70" rx="8" class="zone-bg" filter="url(#glow-normal)"/>
+                                <text x="0" y="-5" text-anchor="middle" class="zone-title">ZONE A</text>
+                                <text x="0" y="15" text-anchor="middle" class="zone-status-text" id="svg-status-ZoneA">VALVE OPEN</text>
+                            </g>
+
+                            <!-- ZONE B TERMINAL -->
+                            <g id="node-ZoneB" transform="translate(750, 300)" class="zone-node normal">
+                                <rect x="-50" y="-35" width="100" height="70" rx="8" class="zone-bg" filter="url(#glow-normal)"/>
+                                <text x="0" y="-5" text-anchor="middle" class="zone-title">ZONE B</text>
+                                <text x="0" y="15" text-anchor="middle" class="zone-status-text" id="svg-status-ZoneB">VALVE OPEN</text>
+                            </g>
+
+                            <!-- ZONE C TERMINAL -->
+                            <g id="node-ZoneC" transform="translate(750, 450)" class="zone-node normal">
+                                <rect x="-50" y="-35" width="100" height="70" rx="8" class="zone-bg" filter="url(#glow-normal)"/>
+                                <text x="0" y="-5" text-anchor="middle" class="zone-title">ZONE C</text>
+                                <text x="0" y="15" text-anchor="middle" class="zone-status-text" id="svg-status-ZoneC">VALVE OPEN</text>
+                            </g>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ================= VIEW: PREDICTIVE ANALYTICS ================= -->
+            <div id="view-predictive" class="view-hidden view-container">
+                <div class="overview-top-row">
+                    <div class="metrics-grid">
+                        <div class="card metric-card glass-panel">
+                            <h3>Weather Conditions</h3>
+                            <div class="value"><span id="val-temp">--</span><span class="unit">°C</span></div>
+                            <div class="sub-text highlight"><span id="val-humid">--</span>% RH</div>
+                        </div>
+                        <div class="card metric-card glass-panel">
+                            <h3>LSTM Flow Forecast</h3>
+                            <div class="value"><span id="val-forecast">--</span><span class="unit">L/min</span></div>
+                            <div class="sub-text highlight" id="val-stress">Polling Sensor Network...</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="chart-section glass-panel">
+                    <h3>Predictive ML Engine Status</h3>
+                    <p style="color: var(--muted); margin-top: 1rem; line-height: 1.5;">
+                        The TensorFlow Keras predictive layer actively analyzes the 30-tick rolling window of flow data against external inputs like Open-Meteo weather telemetry, establishing a multivariate regressor utilizing recurrent memory arrays to project water pipe loads ahead of the actual timestamp curve.
+                    </p>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- Generate unique cache buster -->
+    <script>
+        document.write('<script src="app.js?v=' + Date.now() + '"><\/script>');
+    </script>
+</body>
+</html>

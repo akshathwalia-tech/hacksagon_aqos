@@ -115,4 +115,16 @@ export const notificationsAPI = {
   },
 };
 
+// Control APIs
+export const controlAPI = {
+  updateValve: async (zone, status) => {
+    const response = await api.post('/api/control', { zone, valve_open: status });
+    return response.data;
+  },
+  triggerLeak: async (zone, status) => {
+    const response = await api.post('/api/control', { zone, manual_leak: status });
+    return response.data;
+  }
+};
+
 export default api;
