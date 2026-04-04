@@ -3,7 +3,8 @@ import { dashboardAPI, controlAPI } from '../services/api';
 import { 
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer 
 } from 'recharts';
-import { Droplet, Activity, AlertTriangle, Zap, Settings2 } from 'lucide-react';
+import { Droplet, Activity, AlertTriangle, Zap, Settings2, Shield } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import { Button } from '../components/ui/button';
 import { toast } from 'sonner';
 
@@ -13,6 +14,8 @@ export default function DashboardOverview() {
   const [zoneConsumption, setZoneConsumption] = useState([]);
   const [loading, setLoading] = useState(true);
   const [activeZone, setActiveZone] = useState("Zone A - Downtown");
+  const { user } = useAuth();
+  const isAnalyst = user?.role === 'analyst';
 
   const fetchDashboardData = async () => {
     try {
@@ -113,6 +116,11 @@ export default function DashboardOverview() {
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-outfit font-bold text-slate-900 dark:text-white flex items-center gap-2">
             <Settings2 className="w-5 h-5 text-cyan-500" /> Manual Override
+            {isAnalyst && (
+              <span className="ml-2 text-xs font-normal text-slate-500 flex items-center gap-1 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full">
+                <Shield className="w-3 h-3 text-emerald-500" /> Analyst Mode: Read-Only
+              </span>
+            )}
           </h2>
           <select 
             value={activeZone}
@@ -135,16 +143,16 @@ export default function DashboardOverview() {
         
         <div className="flex flex-col md:flex-row gap-4">
           <div className="flex-1 grid grid-cols-2 gap-4">
-            <Button onClick={() => handleControl('leak', true)} className="bg-orange-500/10 text-orange-500 hover:bg-orange-500/20 border border-orange-500/30">
+            <Button disabled={isAnalyst} onClick={() => handleControl('leak', true)} className="bg-orange-500/10 text-orange-500 hover:bg-orange-500/20 border border-orange-500/30">
               ⚡ Trigger Burst
             </Button>
-            <Button onClick={() => handleControl('leak', false)} className="bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border border-blue-500/30">
+            <Button disabled={isAnalyst} onClick={() => handleControl('leak', false)} className="bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border border-blue-500/30">
               ✓ Seal Pipe
             </Button>
-            <Button onClick={() => handleControl('valve', false)} className="bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/30">
+            <Button disabled={isAnalyst} onClick={() => handleControl('valve', false)} className="bg-red-500/10 text-red-500 hover:bg-red-500/20 border border-red-500/30">
               ⏏ Force Close Valve
             </Button>
-            <Button onClick={() => handleControl('valve', true)} className="bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border border-emerald-500/30">
+            <Button disabled={isAnalyst} onClick={() => handleControl('valve', true)} className="bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border border-emerald-500/30">
               ↻ Open Valve
             </Button>
           </div>

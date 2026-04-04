@@ -2,10 +2,13 @@ import React, { useState, useEffect } from 'react';
 import { leaksAPI } from '../services/api';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
-import { AlertCircle, CheckCircle2, Clock, MapPin, Activity, ShieldAlert } from 'lucide-react';
+import { ShieldAlert, AlertCircle, CheckCircle2, Clock, MapPin, Activity } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
 import { toast } from 'sonner';
 
 export default function LeakDetection() {
+  const { user } = useAuth();
+  const isAnalyst = user?.role === 'analyst';
   const [leaks, setLeaks] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -66,7 +69,7 @@ export default function LeakDetection() {
       </div>
 
       <div className="grid grid-cols-1 gap-4">
-        {leaks.map((leak) => (
+        {leaks.filter(leak => leak.status !== 'resolved').map((leak) => (
           <div key={leak.id} className="glass-card p-6 flex flex-col md:flex-row md:items-center justify-between gap-4 transition-all hover:bg-white/80 dark:hover:bg-slate-800/80">
             <div className="flex items-start gap-4">
               <div className={`p-3 rounded-full ${getSeverityColor(leak.severity)} bg-opacity-20`}>
@@ -101,7 +104,7 @@ export default function LeakDetection() {
               </div>
             </div>
 
-            {leak.status === 'active' && (
+            {leak.status === 'active' && !isAnalyst && (
               <div className="flex gap-2 isolate pt-4 md:pt-0 border-t md:border-t-0 border-slate-100 dark:border-slate-800 mt-2 md:mt-0">
                 <Button 
                   onClick={() => handleStatusUpdate(leak.id, 'acknowledged')}
@@ -118,7 +121,7 @@ export default function LeakDetection() {
               </div>
             )}
             
-            {leak.status === 'acknowledged' && (
+            {leak.status === 'acknowledged' && !isAnalyst && (
               <div className="flex gap-2 isolate pt-4 md:pt-0 border-t md:border-t-0 border-slate-100 dark:border-slate-800 mt-2 md:mt-0">
                 <Button 
                   onClick={() => handleStatusUpdate(leak.id, 'resolved')}
@@ -131,7 +134,7 @@ export default function LeakDetection() {
           </div>
         ))}
 
-        {leaks.length === 0 && (
+        {leaks.filter(l => l.status !== 'resolved').length === 0 && (
           <div className="glass-card p-12 text-center flex flex-col items-center justify-center">
             <CheckCircle2 className="w-16 h-16 text-emerald-500 mb-4 opacity-50" />
             <h3 className="text-xl font-outfit font-bold text-slate-900 dark:text-white">All Clear</h3>

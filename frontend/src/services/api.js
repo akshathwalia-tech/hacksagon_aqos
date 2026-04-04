@@ -101,8 +101,12 @@ export const analyticsAPI = {
     const response = await api.get('/api/analytics/heatmap');
     return response.data;
   },
-  getTrends: async (period = 'week') => {
-    const response = await api.get(`/api/analytics/trends?period=${period}`);
+  getTrends: async (timeRange, zone = null) => {
+    let url = `/api/analytics/trends?time_range=${timeRange}`;
+    if (zone && zone !== "All Regions") {
+      url += `&zone=${encodeURIComponent(zone)}`;
+    }
+    const response = await api.get(url);
     return response.data;
   },
 };

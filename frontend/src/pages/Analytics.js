@@ -10,6 +10,7 @@ export default function Analytics() {
   const [heatmap, setHeatmap] = useState([]);
   const [trends, setTrends] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [trendZone, setTrendZone] = useState("All Regions");
 
   useEffect(() => {
     const fetchAnalytics = async () => {
@@ -30,6 +31,17 @@ export default function Analytics() {
     };
     fetchAnalytics();
   }, []);
+
+  useEffect(() => {
+    if (loading) return;
+    const fetchFilteredTrends = async () => {
+      try {
+        const trendsData = await analyticsAPI.getTrends('week', trendZone);
+        setTrends(trendsData);
+      } catch (error) {}
+    };
+    fetchFilteredTrends();
+  }, [trendZone, loading]);
 
   if (loading) {
     return (
@@ -52,7 +64,19 @@ export default function Analytics() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="glass-card p-6 lg:col-span-2">
-          <h2 className="text-lg font-outfit font-bold text-slate-900 dark:text-white mb-6">7-Day Analysis: Consumption vs Leaks</h2>
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+            <h2 className="text-lg font-outfit font-bold text-slate-900 dark:text-white">7-Day Analysis: Consumption vs Leaks</h2>
+            <select 
+              value={trendZone}
+              onChange={(e) => setTrendZone(e.target.value)}
+              className="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm rounded-lg px-3 py-1 outline-none"
+            >
+              <option value="All Regions">All Regions</option>
+              {heatmap.map(z => (
+                <option key={z.zone} value={z.zone}>{z.zone}</option>
+              ))}
+            </select>
+          </div>
           <div className="h-[350px] w-full">
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={trends} margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>

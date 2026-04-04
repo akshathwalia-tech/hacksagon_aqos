@@ -124,7 +124,6 @@ async def fetch_weather_loop():
 
 def analyze_data(zone: str, flow: float, pressure: float, freq: float):
     if not is_sentinel_trained or sentinel_model is None:
-        # Graceful fallback: Heuristic threshold detection if ML model isn't active
         if flow > 80.0 or freq > 300.0 or system_state[zone].get("manual_leak", False):
             system_state[zone]["alert_status"] = "CRITICAL_LEAK"
         else:
@@ -139,6 +138,31 @@ def analyze_data(zone: str, flow: float, pressure: float, freq: float):
             system_state[zone]["alert_status"] = "NORMAL"
     except: pass
 
+def calculate_zone_metrics(zone: str):
+    flows = [r['flow'] for r in RECENT_DATA_BUFFER if r['zone'] == zone]
+    pressures = [r['pressure'] for r in RECENT_DATA_BUFFER if r['zone'] == zone]
+    current_flow = flows[-1] if flows else 0
+    current_pressure = pressures[-1] if pressures else 5.0
+    state = system_state[zone]
+    
+    efficiency = 100.0
+    leak_risk = 5.0
+    
+    if not state["valve_open"]:
+        efficiency = 0.0
+        leak_risk = 0.0
+    elif state["alert_status"] == "CRITICAL_LEAK" or state["manual_leak"]:
+        efficiency -= 40.0
+        leak_risk = 99.0
+    else:
+        if current_pressure > 40 and current_flow < 5:
+            efficiency -= 15.0
+            leak_risk += 15.0
+        leak_risk += (state["consecutive_leaks"] * 25.0)
+        efficiency -= (current_pressure * 0.1)
+        
+    return max(0.0, min(100.0, efficiency)), max(0.0, min(100.0, leak_risk))
+
 def train_sentinel():
     global is_sentinel_trained
     try:
@@ -152,7 +176,23 @@ def train_sentinel():
 def train_lstm():
     global is_lstm_trained
     if not tf_installed: return
-    data = [[r['flow'], r['temp'], r['humidity']] for r in list(RECENT_DATA_BUFFER) if r['zone'] == ZONES[0]]
+    
+    import csv
+    data = []
+    try:
+        if os.path.exists("live_data.csv"):
+            with open("live_data.csv", mode='r') as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if r.get('zone') == ZONES[0]:
+                        try:
+                            data.append([float(r['flow']), float(r['temp']), float(r['humidity'])])
+                        except: pass
+    except: pass
+    
+    if len(data) < 50:
+        data = [[r['flow'], r['temp'], r['humidity']] for r in list(RECENT_DATA_BUFFER) if r['zone'] == ZONES[0]]
+        
     if len(data) < 35: return
     X, y = [], []
     for i in range(len(data) - 30):
@@ -161,11 +201,14 @@ def train_lstm():
     X_tx = np.array(X)
     y_tx = np.array(y)
     try:
+        print("\n⚙️  Initiating Background LSTM Sequence Training...")
         if lstm_model is None: init_lstm_architecture()
         lstm_model.fit(X_tx, y_tx, epochs=5, verbose=0)
         is_lstm_trained = True
         lstm_model.save(LSTM_MODEL_PATH)
-    except Exception as e: pass
+        print("✅  LSTM Training Complete! Neural Checkpoint Saved to Disk.")
+    except Exception as e: 
+        print(f"❌  LSTM Training Failed: {e}")
 
 async def dynamic_simulator():
     iteration = 0
@@ -302,6 +345,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return User(**user_doc)
     except: raise HTTPException(status_code=401)
 
+class RoleChecker:
+    def __init__(self, allowed_roles: list):
+        self.allowed_roles = allowed_roles
+        
+    def __call__(self, current_user: User = Depends(get_current_user)):
+        if current_user.role not in self.allowed_roles:
+            raise HTTPException(status_code=403, detail="Operation not permitted for your role")
+        return current_user
+
 # --- ENDPOINTS ---
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_input: UserCreate):
@@ -327,7 +379,7 @@ async def login(credentials: UserLogin):
 async def get_me(current_user: User = Depends(get_current_user)): return current_user
 
 @api_router.post("/control")
-async def update_control(req: ControlRequest, current_user: User = Depends(get_current_user)):
+async def update_control(req: ControlRequest, current_user: User = Depends(RoleChecker(["admin", "operator"]))):
     zone = req.zone
     if zone not in system_state: raise HTTPException(status_code=400)
     if req.valve_open is not None:
@@ -341,13 +393,22 @@ async def update_control(req: ControlRequest, current_user: User = Depends(get_c
 async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
     total_consumption = 0
     active_zones = 0
+    total_eff = 0
+    calculated_eff_zones = 0
+    
     for z in ZONES:
         if system_state[z]["valve_open"]: active_zones += 1
         recent_flows = [r['flow'] for r in RECENT_DATA_BUFFER if r['zone'] == z]
         if recent_flows: total_consumption += recent_flows[-1]
-        
+        eff, _ = calculate_zone_metrics(z)
+        if system_state[z]["valve_open"]:
+            total_eff += eff
+            calculated_eff_zones += 1
+            
     alerts = await db.leak_alerts.count_documents({"status": "active"})
     critical_alerts = await db.leak_alerts.count_documents({"status": "active", "severity": "critical"})
+    
+    overall_score = (total_eff / calculated_eff_zones) if calculated_eff_zones > 0 else 0
     
     return {
         "total_consumption": round(total_consumption, 2),
@@ -355,7 +416,7 @@ async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
         "total_zones": len(ZONES),
         "active_alerts": alerts,
         "critical_alerts": critical_alerts,
-        "efficiency_score": random.randint(85, 95),
+        "efficiency_score": round(overall_score, 1),
         "system_state": system_state
     }
 
@@ -409,7 +470,7 @@ async def get_leak_alerts(status: Optional[str] = None, current_user: User = Dep
     return alerts
 
 @api_router.patch("/leaks/{leak_id}/status")
-async def update_leak_status(leak_id: str, status: str, current_user: User = Depends(get_current_user)):
+async def update_leak_status(leak_id: str, status: str, current_user: User = Depends(RoleChecker(["admin", "operator"]))):
     result = await db.leak_alerts.update_one({"id": leak_id}, {"$set": {"status": status}})
     if result.modified_count == 0: raise HTTPException(status_code=404)
     return {"message": "Status updated"}
@@ -417,34 +478,62 @@ async def update_leak_status(leak_id: str, status: str, current_user: User = Dep
 @api_router.get("/forecasts")
 async def get_forecasts(zone_id: Optional[str] = None, current_user: User = Depends(get_current_user)):
     if not is_lstm_trained or not tf_installed:
-        # Graceful fallback: return simulated predictions since TensorFlow isn't available on Python 3.14
+        # Graceful fallback: return simulated predictions since TensorFlow isn't available
         forecasts = []
-        for i in range(7):
+        for i in range(24):
             forecasts.append({
-                "date": (datetime.now(timezone.utc) + timedelta(days=i)).strftime("%Y-%m-%d"),
-                "predicted": random.uniform(1800, 2500),
+                "date": (datetime.now() + timedelta(hours=i)).strftime("%H:00"),
+                "predicted": random.uniform(1800, 2500) if i < 12 else random.uniform(2000, 2800),
                 "lower_bound": random.uniform(1600, 1800),
-                "upper_bound": random.uniform(2500, 2800)
+                "upper_bound": random.uniform(2500, 3000)
             })
-        return forecasts
+        return {"forecasts": forecasts, "weather": global_weather}
         
-    historical = [[r['flow'], r['temp'], r['humidity']] for r in list(RECENT_DATA_BUFFER) if r['zone'] == ZONES[0]][-30:]
-    if len(historical) < 30:
-        return [{"date": (datetime.now(timezone.utc) + timedelta(days=i)).strftime("%Y-%m-%d"), "predicted": 0, "lower_bound": 0, "upper_bound": 0} for i in range(7)]
-        
-    tensor_input = np.array(historical).reshape(1, 30, 3)
-    predicted_val = float(lstm_model.predict(tensor_input, verbose=0)[0][0])
+    historical = []
+    try:
+        if os.path.exists("live_data.csv"):
+            import csv
+            with open("live_data.csv", mode='r') as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if r.get('zone') == ZONES[0]:
+                        try:
+                            historical.append([float(r['flow']), float(r['temp']), float(r['humidity'])])
+                        except: pass
+    except: pass
     
+    if len(historical) < 30:
+        historical = [[r['flow'], r['temp'], r['humidity']] for r in list(RECENT_DATA_BUFFER) if r['zone'] == ZONES[0]]
+        
+    historical = historical[-30:]
+    if len(historical) < 30:
+        return {"forecasts": [{"date": (datetime.now() + timedelta(hours=i)).strftime("%H:00"), "predicted": 0, "lower_bound": 0, "upper_bound": 0} for i in range(24)], "weather": global_weather}
+        
+    current_window = np.array(historical).reshape(1, 30, 3)
     forecasts = []
-    for i in range(7):
-        mut = predicted_val + random.uniform(-2, 2)*i
+    
+    ctemp = global_weather.get("temp", 25.0)
+    chumid = global_weather.get("humidity", 50.0)
+    
+    for i in range(24):
+        # Predict the next hour
+        predicted_val = float(lstm_model.predict(current_window, verbose=0)[0][0])
+        mut = abs(predicted_val) + random.uniform(-0.5, 0.5)
+        
+        # Scale to match UI visualization units
+        scaled_val = mut * 150
         forecasts.append({
-            "date": (datetime.now(timezone.utc) + timedelta(days=i)).strftime("%Y-%m-%d"),
-            "predicted": abs(mut * 1500),
-            "lower_bound": abs((mut-2) * 1400),
-            "upper_bound": abs((mut+2) * 1600)
+            "date": (datetime.now() + timedelta(hours=i)).strftime("%H:00"),
+            "predicted": abs(scaled_val),
+            "lower_bound": abs(scaled_val * 0.9),
+            "upper_bound": abs(scaled_val * 1.1)
         })
-    return forecasts
+        
+        # Shift window for autoregressive forecasting
+        new_step = np.array([[[predicted_val, ctemp, chumid]]])
+        current_window = np.append(current_window[:, 1:, :], new_step, axis=1)
+        
+    return {"forecasts": forecasts, "weather": {"temp": round(ctemp, 1), "humidity": round(chumid, 1)}}
 
 @api_router.post("/ai/analyze")
 async def ai_analysis(request: AIAnalysisRequest, current_user: User = Depends(get_current_user)):
@@ -465,11 +554,37 @@ async def ai_analysis(request: AIAnalysisRequest, current_user: User = Depends(g
 
 @api_router.get("/analytics/heatmap")
 async def get_heatmap(current_user: User = Depends(get_current_user)):
-    return [{"zone": z.split(" - ")[0], "consumption": 0, "efficiency": random.uniform(80,95), "leak_risk": 99 if system_state[z]['manual_leak'] else random.uniform(5,15)} for z in ZONES]
+    res = []
+    for z in ZONES:
+        eff, risk = calculate_zone_metrics(z)
+        res.append({
+            "zone": z.split(" - ")[0], 
+            "consumption": 0, 
+            "efficiency": eff, 
+            "leak_risk": risk
+        })
+    return res
 
 @api_router.get("/analytics/trends")
-async def get_trends(current_user: User = Depends(get_current_user)):
-    return [{"date": (datetime.now(timezone.utc) - timedelta(days=7-i)).strftime("%Y-%m-%d"), "consumption": random.uniform(18000, 25000), "leaks_detected": random.randint(0,2)} for i in range(7)]
+async def get_trends(zone: Optional[str] = None, current_user: User = Depends(get_current_user)):
+    import hashlib
+    trends = []
+    for i in range(7):
+        target_date = datetime.now(timezone.utc) - timedelta(days=7-i)
+        date_str = target_date.strftime("%Y-%m-%d")
+        seed_string = f"{date_str}-{zone or 'ALL'}"
+        day_seed = int(hashlib.md5(seed_string.encode()).hexdigest(), 16)
+        day_random = random.Random(day_seed)
+        
+        if zone and zone != "All Regions":
+            consumption = day_random.uniform(4000, 6500)
+            leaks = 1 if day_random.random() > 0.8 else 0
+        else:
+            consumption = day_random.uniform(18000, 25000)
+            leaks = int(day_random.uniform(0, 3.99))
+            
+        trends.append({"date": date_str, "consumption": consumption, "leaks_detected": leaks})
+    return trends
 
 @api_router.get("/notifications")
 async def get_notifications(current_user: User = Depends(get_current_user)):
@@ -486,6 +601,9 @@ async def shutdown():
 @app.on_event("startup")
 async def startup():
     load_models()
+    if not is_lstm_trained:
+        print("\n⚠️  No existing LSTM model found. Executing instant cold-start training from initial CSV data...")
+        train_lstm()
     asyncio.create_task(fetch_weather_loop())
     asyncio.create_task(dynamic_simulator())
 
